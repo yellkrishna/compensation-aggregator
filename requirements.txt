@@ -7,3 +7,6 @@ lxml
 html5lib
 python-dotenv
 openai
+langchain-community
+streamlit-aggrid
+xlsxwriter
