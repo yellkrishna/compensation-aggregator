@@ -1,51 +1,69 @@
 import streamlit as st
 import pandas as pd
-from scrape import scrape_website
+from scrape import scrape_website  # Import the individual scrape function
 from st_aggrid import AgGrid, GridOptionsBuilder
 import io
 
-st.title("compensation-aggregator")
-url = st.text_input("Enter URL:")
+st.title("Compensation Aggregator")
+
+# Upload the Excel file (first column: company names, second column: URLs)
+uploaded_file = st.file_uploader("Upload Excel file containing company names and URLs", type=["xlsx", "xls"])
 
 headless_mode = st.checkbox("Run Chrome in headless mode", value=True)
 
-if st.button("Scrape site"):
-    st.markdown("**Scraping the website recursively. Please wait...**")
-    results = scrape_website(url, max_depth=2, max_breadth=6, headless=headless_mode)
+if uploaded_file is not None:
+    # Read the uploaded Excel file.
+    url_df = pd.read_excel(uploaded_file)
+    st.markdown(f"**Found {len(url_df)} companies in the uploaded file.**")
     
-    if results.empty:
-        st.warning("No job postings were found.")
-    else:
-        st.markdown(f"**Scraping complete! Found {len(results)} job postings.**")
-        df = results.copy()
+    if st.button("Scrape sites"):
+        st.markdown("**Scraping sites... Please wait.**")
         
-        # Build grid options for AgGrid display.
-        # Use original columns and apply cell styling to visually truncate long text.
-        gb = GridOptionsBuilder.from_dataframe(
-            df[["title", "location", "salary_range", "responsibilities", "qualification", "description"]]
-        )
+        all_dfs = []  # List to hold DataFrames from each company
         
-        # Define a style that truncates text with ellipsis if it overflows the cell.
-        truncate_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
-        
-        # Configure the columns with potentially long text.
-        gb.configure_column("description", cellStyle=truncate_style, tooltipField="description")
-        gb.configure_column("qualification", cellStyle=truncate_style, tooltipField="qualification")
-        gb.configure_column("responsibilities", cellStyle=truncate_style, tooltipField="responsibilities")
-        
-        gridOptions = gb.build()
-        
-        AgGrid(df, gridOptions=gridOptions, allow_unsafe_jscode=True)
-        
-        # Convert DataFrame to Excel file in memory and add a download button.
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Job Postings')
-        buffer.seek(0)
-        
-        st.download_button(
-            "Download Excel File",
-            data=buffer,
-            file_name="job_postings.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # Iterate over each row to get company name and URL.
+        for index, row in url_df.iterrows():
+            company_name = row.iloc[0]  # Company name in the first column
+            url = row.iloc[1]           # URL in the second column
+            st.markdown(f"Scraping jobs for **{company_name}** from URL: {url}")
+            
+            # Call the scraping function for this URL.
+            df = scrape_website(url, max_depth=2, max_breadth=6, headless=headless_mode)
+            
+            if not df.empty:
+                # Insert a new column at the beginning for the company name.
+                df.insert(0, "company", company_name)
+                all_dfs.append(df)
+            else:
+                st.warning(f"No job postings found for {company_name}.")
+
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            st.markdown(f"**Scraping complete! Found {len(final_df)} job postings across all companies.**")
+            
+            # Set up AgGrid options for display.
+            gb = GridOptionsBuilder.from_dataframe(
+                final_df[["company", "title", "location", "salary_range", "responsibilities", "qualification", "description"]]
+            )
+            truncate_style = {"whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"}
+            gb.configure_column("description", cellStyle=truncate_style, tooltipField="description")
+            gb.configure_column("qualification", cellStyle=truncate_style, tooltipField="qualification")
+            gb.configure_column("responsibilities", cellStyle=truncate_style, tooltipField="responsibilities")
+            gridOptions = gb.build()
+            
+            AgGrid(final_df, gridOptions=gridOptions, allow_unsafe_jscode=True)
+            
+            # Create an in-memory Excel file.
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='Job Postings')
+            buffer.seek(0)
+            
+            st.download_button(
+                "Download Excel File",
+                data=buffer,
+                file_name="job_postings.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("No job postings found across the provided URLs.")

@@ -10,3 +10,4 @@ openai
 langchain-community
 streamlit-aggrid
 xlsxwriter
+openpyxl

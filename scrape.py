@@ -242,12 +242,12 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
         try:
             print(f"Scraping {url} at depth {depth}...")
             driver.get(url)
-
+            time.sleep(5)
             # Wait for the <body> to be present, indicating the page has (mostly) loaded
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
             # (Optional) Slight random delay to prevent rapid-fire requests
-            time.sleep(8)
+            time.sleep(5)
             time.sleep(random.uniform(10, 17))
 
             # Attempt multiple scrolls for lazy-loaded job listings
@@ -255,7 +255,7 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
 
             # Simulate random clicks to trigger additional dynamic content loading
             random_clicks(driver, clicks=random.randint(1, 3), wait_time=random.uniform(1, 3))
-            time.sleep(2)
+            time.sleep(5)
             valid_job_posting_links = []
             # --- Process iframes ---
             iframe_elements = driver.find_elements(By.TAG_NAME, "iframe")
@@ -324,7 +324,6 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
             ignored_links = footer_links.union(header_links, nav_links)
 
             # Gather and filter page links
-            time.sleep(2)
             page_links = driver.find_elements(By.TAG_NAME, "a")
             
             apply_link_found = False
@@ -344,8 +343,6 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
                 if any(keyword in link_text for keyword in ["apply", "submit"]):
                     apply_link_found = True
                     print(f"Apply link found: {clean_href}")
-                else:
-                    print("apply link not found")
 
                 if parsed_href.netloc == domain and clean_href not in ignored_links and clean_href.startswith("http") and clean_href not in visited:
                     if is_job_posting_link(link):
@@ -363,6 +360,7 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
 
             if apply_link_found:
                 # Convert the current page to markdown using Jina API
+                time.sleep(5)
                 markdown_content = convert_to_markdown(url)
                 print("Markdown:\n", markdown_content)
 
@@ -396,3 +394,29 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
     finally:
         print("Closing Chrome browser.")
         driver.quit()
+
+
+def scrape_websites(url_list, max_depth=2, max_breadth=10, headless=True):
+    """
+    Scrapes multiple websites from a list of URLs.
+    For each URL, it calls the scrape_website function and aggregates the results.
+    
+    :param url_list: A list of URLs to scrape.
+    :param max_depth: Maximum recursion depth for each site.
+    :param max_breadth: Maximum number of links to follow on each page.
+    :param headless: Boolean indicating whether Chrome should run headless.
+    :return: A DataFrame containing all job postings from the provided URLs.
+    """
+    all_dfs = []
+    for url in url_list:
+        print(f"Starting scrape for {url}...")
+        df = scrape_website(url, max_depth=max_depth, max_breadth=max_breadth, headless=headless)
+        if not df.empty:
+            all_dfs.append(df)
+        else:
+            print(f"No job postings found for {url}.")
+    
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    else:
+        return pd.DataFrame()
