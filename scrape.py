@@ -242,20 +242,20 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
         try:
             print(f"Scraping {url} at depth {depth}...")
             driver.get(url)
-            time.sleep(5)
+            # time.sleep(5)
             # Wait for the <body> to be present, indicating the page has (mostly) loaded
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
             # (Optional) Slight random delay to prevent rapid-fire requests
-            time.sleep(5)
-            time.sleep(random.uniform(10, 17))
+            # time.sleep(2)
+            time.sleep(random.uniform(5, 7))
 
             # Attempt multiple scrolls for lazy-loaded job listings
             repeatedly_scroll(driver, scroll_pause=2, max_scrolls=5)
 
             # Simulate random clicks to trigger additional dynamic content loading
             random_clicks(driver, clicks=random.randint(1, 3), wait_time=random.uniform(1, 3))
-            time.sleep(5)
+            time.sleep(3)
             valid_job_posting_links = []
             # --- Process iframes ---
             iframe_elements = driver.find_elements(By.TAG_NAME, "iframe")
@@ -360,7 +360,7 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
 
             if apply_link_found:
                 # Convert the current page to markdown using Jina API
-                time.sleep(5)
+                time.sleep(3)
                 markdown_content = convert_to_markdown(url)
                 print("Markdown:\n", markdown_content)
 

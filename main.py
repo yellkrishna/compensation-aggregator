@@ -3,6 +3,7 @@ import pandas as pd
 from scrape import scrape_website  # Import the individual scrape function
 from st_aggrid import AgGrid, GridOptionsBuilder
 import io
+import time 
 
 st.title("Compensation Aggregator")
 
@@ -18,6 +19,9 @@ if uploaded_file is not None:
     
     if st.button("Scrape sites"):
         st.markdown("**Scraping sites... Please wait.**")
+
+        # Start timer
+        start_time = time.time()
         
         all_dfs = []  # List to hold DataFrames from each company
         
@@ -28,7 +32,7 @@ if uploaded_file is not None:
             st.markdown(f"Scraping jobs for **{company_name}** from URL: {url}")
             
             # Call the scraping function for this URL.
-            df = scrape_website(url, max_depth=2, max_breadth=6, headless=headless_mode)
+            df = scrape_website(url, max_depth=2, max_breadth=3, headless=headless_mode)
             
             if not df.empty:
                 # Insert a new column at the beginning for the company name.
@@ -40,6 +44,10 @@ if uploaded_file is not None:
         if all_dfs:
             final_df = pd.concat(all_dfs, ignore_index=True)
             st.markdown(f"**Scraping complete! Found {len(final_df)} job postings across all companies.**")
+
+            # Stop timer and calculate elapsed time
+            elapsed_time = time.time() - start_time
+            st.markdown(f"**Time taken:** {elapsed_time:.2f} seconds")
             
             # Set up AgGrid options for display.
             gb = GridOptionsBuilder.from_dataframe(
