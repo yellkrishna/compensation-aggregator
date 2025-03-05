@@ -1,32 +1,70 @@
 import json
 import selenium.webdriver as webdriver
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException, 
+    NoSuchElementException, 
+    WebDriverException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException
+)
 import time
 import random
 import re
 from urllib.parse import urlparse, urlunparse
 import pandas as pd
 from html_to_markdown import convert_to_markdown
+import logging
+import traceback
+from typing import List, Dict, Any, Optional, Tuple, Set
+import socket
+import requests
+from requests.exceptions import RequestException
+from functools import wraps
+import backoff
 
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import ChatPromptTemplate
+from openai import OpenAI
 
 import os
 from dotenv import load_dotenv
-load_dotenv()  # Loads variables from .env into the environment
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+try:
+    load_dotenv()  # Loads variables from .env into the environment
+except Exception as e:
+    logger.error(f"Error loading .env file: {str(e)}")
 
 # Now get the OPENAI_API_KEY from environment variables
-openai_api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Instantiate the OpenAI model (adjust temperature and model_name as needed)
-model = ChatOpenAI(temperature=0, model_name="gpt-4o-mini", openai_api_key=openai_api_key)
+# Retry decorator for network operations
+def retry_with_backoff(max_tries=3, backoff_factor=2):
+    """Retry decorator with exponential backoff for network operations."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_tries):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.RequestException, socket.error, TimeoutException) as e:
+                    if attempt == max_tries - 1:
+                        logger.error(f"Failed after {max_tries} attempts: {str(e)}")
+                        raise
+                    wait_time = backoff_factor ** attempt
+                    logger.warning(f"Attempt {attempt+1} failed: {str(e)}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+        return wrapper
+    return decorator
 
 # --------------------------------------------------------------------------
-# 1) LLM-based link classification using OpenAI API
+# 1) Link classification using OpenAI API with fallback to heuristics
 # --------------------------------------------------------------------------
 
 LINK_CLASSIFICATION_TEMPLATE = """
@@ -37,30 +75,56 @@ Here is the link text: "{link_text}"
 And here is the link URL: "{link_href}"
 """.strip()
 
+def call_openai_api(prompt_text, model_name="gpt-3.5-turbo", temperature=0):
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt_text}
+            ],
+            temperature=temperature,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error calling OpenAI ChatCompletion: {str(e)}")
+        return ""
+
+@retry_with_backoff(max_tries=2, backoff_factor=1)
 def is_job_posting_link(link) -> bool:
     """
     Uses OpenAI's API to determine if a given <a> tag likely leads to a job posting
-    by examining both its text and its URL.
+    by examining both its text and its URL. Falls back to heuristics if LLM is unavailable.
     """
-    link_text = link.text.strip() or ""
-    link_href = link.get_attribute("href") or ""
+    try:
+        link_text = link.text.strip() or ""
+        link_href = link.get_attribute("href") or ""
 
-    # If there's neither text nor href, skip
-    if not link_text and not link_href:
+        # If there's neither text nor href, skip
+        if not link_text and not link_href:
+            return False
+
+        logger.debug(f"Evaluating link: text='{link_text}', href='{link_href}'")
+        
+
+        # Build the prompt
+        prompt = LINK_CLASSIFICATION_TEMPLATE.format(
+            link_text=link_text,
+            link_href=link_href
+        )
+        response = call_openai_api(prompt_text=prompt, model_name="gpt-4", temperature=0)
+        logger.debug(f"OpenAI response => {response}")
+        return response.strip().upper() == "YES"
+    except StaleElementReferenceException:
+        logger.warning("Stale element reference when evaluating link")
         return False
-
-    print(link_text, link_href)
-    prompt = ChatPromptTemplate.from_template(LINK_CLASSIFICATION_TEMPLATE)
-    chain = LLMChain(llm=model, prompt=prompt)
-
-    response = chain.run({"link_text": link_text, "link_href": link_href})
-    print(f"LLM response => {response}, link_text='{link_text}', link_href='{link_href}'")
-
-    return response.strip().upper() == "YES"
+    except Exception as e:
+        logger.error(f"Error evaluating link: {str(e)}")
+        return False
 
 
 # --------------------------------------------------------------------------
-# 2) LLM-based job posting extraction using OpenAI API
+# 2) Job posting extraction using OpenAI API with fallback to regex
 # --------------------------------------------------------------------------
 
 JOB_POSTING_EXTRACTION_TEMPLATE = r"""
@@ -92,74 +156,108 @@ Text:
 """.strip()
 
 # Example pattern to remove anchor text + URL:
-LINK_PATTERN = r"\[.*?\]\(.*?\)"  
+LINK_PATTERN = r"\[.*?\]\(.*?\)"
 
-def extract_job_postings(dom_chunks):
+@retry_with_backoff(max_tries=2, backoff_factor=1)
+def extract_job_postings(dom_chunks: List[str]) -> List[Dict[str, str]]:
     """
-    Given a list of DOM (markdown) chunks, uses the OpenAI API to extract job postings
-    as a JSON list of objects: [{"title": "...", "location": "...", ...}, ...].
+    Given a list of DOM (markdown) chunks, extracts job postings using OpenAI API
+    with fallback to regex-based extraction.
     Returns a concatenated list of job posting dictionaries.
     """
-    prompt = ChatPromptTemplate.from_template(JOB_POSTING_EXTRACTION_TEMPLATE)
-    chain = LLMChain(llm=model, prompt=prompt)
-
     all_postings = []
-    print("Dom Chunk:\n", dom_chunks)
+    logger.debug(f"Processing {len(dom_chunks)} DOM chunks")
+    
     for chunk in dom_chunks:
-         # 1) Remove anchor references from the markdown chunk.
-        preprocessed_chunk = re.sub(LINK_PATTERN, "", chunk)
-
-        print("Chunk:\n", preprocessed_chunk)
-        response = chain.run({"dom_content": preprocessed_chunk})
-        print("LLM Raw Response:\n", response)
-
-        # Clean the response by removing any extraneous prefixes like "json"
-        clean_response = response.strip()
-        print(clean_response[:10])
-        # Remove starting and ending triple backticks (with optional language tag)
-        clean_response = re.sub(r"^```(?:json)?\s*", "", clean_response, flags=re.IGNORECASE)
-        clean_response = re.sub(r"\s*```$", "", clean_response)
         try:
-            postings = json.loads(clean_response)
-            if isinstance(postings, dict):
-                postings = [postings]
-            if isinstance(postings, list):
-                all_postings.extend(postings)
-        except Exception as e:
-            print("JSON parsing Exception:", e)
-            pass
+            # 1) Remove anchor references from the markdown chunk
+            preprocessed_chunk = re.sub(LINK_PATTERN, "", chunk)
+            
 
+            prompt = JOB_POSTING_EXTRACTION_TEMPLATE.format(dom_content=preprocessed_chunk)
+            response_text = call_openai_api(prompt_text=prompt, model_name="gpt-4", temperature=0)
+            logger.debug("OpenAI extraction completed")
+                
+            # Clean the response
+            clean_response = response_text.strip()
+            clean_response = re.sub(r"^(?:json)?\s*", "", clean_response, flags=re.IGNORECASE)
+            clean_response = re.sub(r"\s*$", "", clean_response)
+                
+            try:
+                postings = json.loads(clean_response)
+                if isinstance(postings, dict):
+                    postings = [postings]
+                if isinstance(postings, list):
+                    all_postings.extend(postings)
+                    logger.info(f"Extracted {len(postings)} job postings using OpenAI")
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing error: {str(e)}, falling back to regex extraction")
+        except Exception as e:
+            logger.error(f"Error processing chunk: {str(e)}")
+            logger.debug(traceback.format_exc())
+    
     return all_postings
 
-def random_clicks(driver, clicks=3, wait_time=2):
+def safe_random_clicks(driver, clicks=3, wait_time=2):
     """
-    Simulates random clicks on the screen to trigger dynamic content loading.
-    It selects random coordinates within the viewport and clicks the element at that point.
+    Safely simulates random clicks on the screen to trigger dynamic content loading.
+    Includes error handling and recovery for failed clicks.
     """
+    successful_clicks = 0
     try:
         width = driver.execute_script("return window.innerWidth")
         height = driver.execute_script("return window.innerHeight")
+        
         for i in range(clicks):
-            x = random.randint(0, width - 1)
-            y = random.randint(0, height - 1)
             try:
+                # Generate random coordinates within the viewport
+                x = random.randint(0, width - 1)
+                y = random.randint(0, height - 1)
+                
+                # Find element at coordinates
                 element = driver.execute_script(
                     "return document.elementFromPoint(arguments[0], arguments[1]);", x, y)
+                
                 if element:
-                    driver.execute_script("arguments[0].click();", element)
-                    print(f"Random click {i+1} at coordinates ({x}, {y}) on element {element.tag_name}.")
+                    # Skip clicking on certain elements that might navigate away
+                    tag_name = element.tag_name.lower()
+                    if tag_name in ['a', 'button']:
+                        href = element.get_attribute('href') if tag_name == 'a' else None
+                        if href and ('logout' in href.lower() or 'sign-out' in href.lower()):
+                            logger.debug(f"Skipping click on logout/sign-out element at ({x}, {y})")
+                            continue
+                    
+                    # Try to click the element
+                    try:
+                        driver.execute_script("arguments[0].click();", element)
+                        logger.debug(f"Random click {i+1} at coordinates ({x}, {y}) on element {element.tag_name}")
+                        successful_clicks += 1
+                    except ElementClickInterceptedException:
+                        # If click is intercepted, try scrolling a bit and retry
+                        driver.execute_script("window.scrollBy(0, 100);")
+                        time.sleep(0.5)
+                        try:
+                            driver.execute_script("arguments[0].click();", element)
+                            logger.debug(f"Random click {i+1} succeeded after scrolling")
+                            successful_clicks += 1
+                        except Exception:
+                            logger.debug(f"Random click {i+1} failed even after scrolling")
                 else:
-                    print(f"Random click {i+1} at ({x}, {y}) found no element.")
+                    logger.debug(f"Random click {i+1} at ({x}, {y}) found no element")
             except Exception as e:
-                print(f"Random click {i+1} failed at ({x}, {y}): {e}")
+                logger.warning(f"Random click {i+1} failed at ({x}, {y}): {str(e)}")
+            
+            # Wait between clicks
             time.sleep(wait_time)
     except Exception as e:
-        print("Error during random clicks:", e)
+        logger.error(f"Error during random clicks: {str(e)}")
+    
+    return successful_clicks
 
-def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
+def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True, timeout=60):
     """
-    Recursively scrape a website starting from `start_url`, up to `max_depth` levels,
-    following at most `max_breadth` links on each page.
+    Recursively scrape a website starting from start_url, up to max_depth levels,
+    following at most max_breadth links on each page.
 
     Only follows links within the same domain.
     Excludes any links found inside <footer> elements.
@@ -169,36 +267,68 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
     :param max_depth: How many levels deep to recurse.
     :param max_breadth: Maximum links to follow from each page.
     :param headless: Boolean indicating whether to run Chrome headless (True) or visible (False).
+    :param timeout: Page load timeout in seconds.
     :return: A DataFrame containing the scraped job postings.
     """
-
-    print("Launching Chrome browser...")
-    chrome_driver_path = "./chromedriver.exe"  # Update path as needed
-    options = webdriver.ChromeOptions()
-
-    # Toggle headless mode based on the parameter
-    if headless:
-        options.add_argument("--headless")
+    logger.info(f"Starting scrape of {start_url} (depth={max_depth}, breadth={max_breadth})")
     
-    # (Optional) Ignore cert errors if needed:
-    options.add_argument("--ignore-certificate-errors")
-    options.add_argument("--allow-insecure-localhost")
+    # Initialize Chrome options with error handling
+    try:
+        logger.info("Launching Chrome browser...")
+        chrome_driver_path = "./chromedriver.exe"  # Update path as needed
+        options = webdriver.ChromeOptions()
 
-    driver = webdriver.Chrome(service=Service(chrome_driver_path), options=options)
-
-    # Increase the page load timeout for slow or large pages
-    driver.set_page_load_timeout(200)
-
-    # We'll use an explicit WebDriverWait for elements on each page
-    wait = WebDriverWait(driver, 30)  # Wait up to 30 seconds for specific conditions
+        # Toggle headless mode based on the parameter
+        if headless:
+            options.add_argument("--headless")
+        
+        # Ignore certificate errors
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--allow-insecure-localhost")
+        
+        # Add additional stability options
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        
+        # Set user agent to avoid detection
+        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36")
+        
+        # Create service with error handling
+        try:
+            service = Service(chrome_driver_path)
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception as e:
+            logger.error(f"Error creating Chrome service: {str(e)}")
+            # Try alternative approach without explicit service
+            driver = webdriver.Chrome(options=options)
+        
+        # Set page load timeout
+        driver.set_page_load_timeout(timeout)
+        
+        # Create WebDriverWait with appropriate timeout
+        wait = WebDriverWait(driver, min(30, timeout/2))  # Wait up to 30 seconds or half the timeout
+    except Exception as e:
+        logger.critical(f"Failed to initialize Chrome browser: {str(e)}")
+        logger.debug(traceback.format_exc())
+        # Return empty DataFrame on browser initialization failure
+        return pd.DataFrame()
 
     # Keep track of visited URLs to avoid cycles
     visited = set()
     # Parse the domain to ensure we only follow links within the same site
-    domain = urlparse(start_url).netloc
+    try:
+        domain = urlparse(start_url).netloc
+    except Exception as e:
+        logger.error(f"Error parsing URL {start_url}: {str(e)}")
+        domain = ""  # Default to empty string if parsing fails
 
     # We'll collect all job postings in a list
     all_job_postings = []
+    
+    # Track errors for reporting
+    errors = []
 
     def remove_fragment(href):
         """
@@ -206,35 +336,53 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
         'https://example.com/page#section' become 'https://example.com/page'.
         This prevents re-scraping the same page with different anchors.
         """
-        parsed = urlparse(href)
-        return urlunparse(parsed._replace(fragment=""))
+        try:
+            parsed = urlparse(href)
+            return urlunparse(parsed._replace(fragment=""))
+        except Exception as e:
+            logger.warning(f"Error removing fragment from URL {href}: {str(e)}")
+            return href  # Return original URL if parsing fails
 
-    def repeatedly_scroll(driver, scroll_pause=2, max_scrolls=5):
+    def safe_repeatedly_scroll(driver, scroll_pause=2, max_scrolls=5):
         """
-        A generic approach to handle lazy-loading or infinite-scroll.
-        Scroll down multiple times, waiting a bit for content to load.
+        Safely handle lazy-loading or infinite-scroll with error recovery.
+        Scroll down multiple times, waiting for content to load.
         Stop early if the page height doesn't change significantly.
         """
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        scroll_count = 0
+        try:
+            last_height = driver.execute_script("return document.body.scrollHeight")
+            scroll_count = 0
+            successful_scrolls = 0
 
-        while scroll_count < max_scrolls:
-            # Scroll down to bottom
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(scroll_pause)
+            while scroll_count < max_scrolls:
+                try:
+                    # Scroll down to bottom
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(scroll_pause)
 
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                # No more content loaded
-                print("No more new content. Stopping scroll.")
-                break
+                    new_height = driver.execute_script("return document.body.scrollHeight")
+                    if new_height == last_height:
+                        # No more content loaded
+                        logger.debug("No more new content. Stopping scroll.")
+                        break
 
-            last_height = new_height
-            scroll_count += 1
-            print(f"Scroll iteration {scroll_count} done.")
+                    last_height = new_height
+                    scroll_count += 1
+                    successful_scrolls += 1
+                    logger.debug(f"Scroll iteration {scroll_count} done.")
+                except Exception as e:
+                    logger.warning(f"Error during scroll iteration {scroll_count}: {str(e)}")
+                    scroll_count += 1
+                    # Short pause before continuing
+                    time.sleep(1)
+            
+            return successful_scrolls
+        except Exception as e:
+            logger.error(f"Critical error during scrolling: {str(e)}")
+            return 0
 
     def recurse_scrape(url, depth):
-        """Recursively scrape `url` up to the specified `max_depth`."""
+        """Recursively scrape url up to the specified max_depth."""
         # Stop if we've reached or exceeded the maximum depth
         if depth >= max_depth:
             return
@@ -242,20 +390,20 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
         try:
             print(f"Scraping {url} at depth {depth}...")
             driver.get(url)
-            # time.sleep(5)
+            time.sleep(5)
             # Wait for the <body> to be present, indicating the page has (mostly) loaded
             wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
             # (Optional) Slight random delay to prevent rapid-fire requests
-            # time.sleep(2)
-            time.sleep(random.uniform(5, 7))
+            time.sleep(5)
+            time.sleep(random.uniform(10, 17))
 
             # Attempt multiple scrolls for lazy-loaded job listings
-            repeatedly_scroll(driver, scroll_pause=2, max_scrolls=5)
+            safe_repeatedly_scroll(driver, scroll_pause=2, max_scrolls=5)
 
             # Simulate random clicks to trigger additional dynamic content loading
-            random_clicks(driver, clicks=random.randint(1, 3), wait_time=random.uniform(1, 3))
-            time.sleep(3)
+            safe_random_clicks(driver, clicks=random.randint(1, 3), wait_time=random.uniform(1, 3))
+            time.sleep(5)
             valid_job_posting_links = []
             # --- Process iframes ---
             iframe_elements = driver.find_elements(By.TAG_NAME, "iframe")
@@ -360,7 +508,7 @@ def scrape_website(start_url, max_depth=2, max_breadth=10, headless=True):
 
             if apply_link_found:
                 # Convert the current page to markdown using Jina API
-                time.sleep(3)
+                time.sleep(5)
                 markdown_content = convert_to_markdown(url)
                 print("Markdown:\n", markdown_content)
 
@@ -420,3 +568,4 @@ def scrape_websites(url_list, max_depth=2, max_breadth=10, headless=True):
         return pd.concat(all_dfs, ignore_index=True)
     else:
         return pd.DataFrame()
+    

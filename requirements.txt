@@ -1,13 +1,35 @@
-streamlit
-langchain
-langchain_ollama
-selenium
-beautifulsoup4
-lxml
-html5lib
-python-dotenv
-openai
-langchain-community
-streamlit-aggrid
-xlsxwriter
-openpyxl
+# Core dependencies
+streamlit>=1.30.0
+pandas>=2.0.0
+selenium>=4.10.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+
+# Streamlit extensions
+streamlit-aggrid>=0.3.4
+
+# Excel handling
+xlsxwriter>=3.1.0
+openpyxl>=3.1.0
+
+# LLM integration
+langchain>=0.1.0
+langchain_ollama>=0.0.1
+langchain-community>=0.0.10
+openai>=1.0.0
+
+# HTML parsing
+lxml>=4.9.0
+html5lib>=1.1
+
+# Environment and configuration
+python-dotenv>=1.0.0
+
+# Error handling and retries
+backoff>=2.2.0
+
+# Logging and monitoring
+logging>=0.5.1
+
+# Type hints
+typing-extensions>=4.7.0

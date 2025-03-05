@@ -1,3 +1,52 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+app.log
+
+# Environment variables
 .env
-venv
-chromedriver.exe
+
+# Selenium drivers
+chromedriver*
+geckodriver*
+*.exe
+
+# Data files
+*.csv
+*.xlsx
+*.xls
+
+# Temporary files
+temp/
+tmp/
+
+# Cached files
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS specific files
+.DS_Store
+Thumbs.db
